@@ -1,0 +1,17 @@
+# Large local data (not tracked)
+/papers/
+/output_videos/
+/datasets/
+/results/
+
+# Model weights (mobileclip_blt.ts alone is ~600 MB, over GitHub's 100 MB limit)
+/models/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment / editor
+.env
+.vscode/
