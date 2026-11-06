@@ -52,6 +52,15 @@ class KeyframeConfig:
     min_cells: int = 2              # image quadrants holding >= cell_share of those edges
     cell_share: float = 0.05
     unmask_below_prior: float = 0.7  # edge budget: masked objects below this prior may be given back
+    # Speed limit (not in the paper): what the camera's carrier can physically do, known before
+    # any data is seen - a handheld / head-worn camera moves at most ~1.5 m/s (fast walk) and
+    # turns at most ~240 deg/s. Scaled by the time since the last trusted frame (timestamps).
+    # A tracked pose beyond it is wrong whatever its match ratio: a degenerate alignment can
+    # "match" 100 % of edges by pushing the scene far away so all points collapse onto one edge.
+    # The motion model is limited to it too, and fades while coasting.
+    max_speed_mps: float = 1.5
+    max_turn_dps: float = 240.0
+    coast_damping: float = 0.8      # velocity kept per coasted frame (unknown motion -> slow down)
 
 
 @dataclass
@@ -83,6 +92,7 @@ class FrameRecord:
     kf_refused: bool = False  # a keyframe was due, but the frame had too few edges to anchor it
     weak_kf: bool = False     # keyframe re-anchored after a lost run (pose from the motion model)
     ba_rejected: bool = False  # this keyframe's window optimisation moved a keyframe too far: undone
+    too_fast: bool = False    # tracked pose broke the speed limit (treated as lost)
 
 
 @dataclass
@@ -112,13 +122,15 @@ class DTVO:
         self.keyframes: dict[int, Keyframe] = {}
         self.kf: Keyframe | None = None
         self.records: list[FrameRecord] = []
-        self.T_prev = self.T_prev2 = None
+        self.T_prev = None
         self.rng = np.random.default_rng(cfg.seed)
         self.times = {"prepare": 0.0, "edges+DT": 0.0, "tracking": 0.0, "mapping": 0.0}
         self.frame_index = 0
         self.lost_run = 0
         self.debug: FrameDebug | None = None
         self.T_good, self.motion_good = np.eye(4), np.eye(4)   # last frame not flagged lost
+        self.t_prev = self.t_good = 0.0                         # their timestamps
+        self.velocity = np.eye(4)   # motion per frame (speed-limited), for hypotheses and coasting
 
     # -------------------------------------------------------------------------
     def _new_keyframe(self, T_wc, frame, edge_maps, dts) -> Keyframe:
@@ -141,6 +153,13 @@ class DTVO:
         ref = self.kf.type_counts[:N_TYPES - 1]
         big = ref >= c.type_min_count
         return bool(np.any(res.type_inliers[:N_TYPES - 1][big] < c.type_keep_ratio * ref[big]))
+
+    def _limit(self, T: np.ndarray, dt: float) -> np.ndarray:
+        """Motion T over dt seconds, scaled down (on the manifold) to the speed limit."""
+        c = self.cfg.keyframe
+        s = min(1.0, c.max_speed_mps * dt / max(np.linalg.norm(T[:3, 3]), 1e-12),
+                c.max_turn_dps * dt / max(rot_angle_deg(T[:3, :3]), 1e-12))
+        return T if s >= 1.0 else scale_motion(T, s)
 
     def _support(self, edge_maps: list[EdgeMap]) -> tuple[int, int, int]:
         """(level-0 edges with depth, coarsest-level edges with depth, image quadrants holding
@@ -208,9 +227,11 @@ class DTVO:
         self.times["edges+DT"] += t2 - t1 - t_filter
         n_edges = len(edge_maps[0].uv)
 
-        def record(kf_id, T_kc, ratio, hyp, lost, is_kf, refused=False, weak=False, ba_rejected=False):
+        def record(kf_id, T_kc, ratio, hyp, lost, is_kf, refused=False, weak=False, ba_rejected=False,
+                   too_fast=False):
             self.records.append(FrameRecord(frame.timestamp, kf_id, T_kc, ratio, hyp, lost, is_kf, n_edges,
-                                            n_masked, support[0], n_unmasked, refused, weak, ba_rejected))
+                                            n_masked, support[0], n_unmasked, refused, weak, ba_rejected,
+                                            too_fast))
 
         if self.kf is None:  # RGB-D: no initialisation needed, first frame = first keyframe
             kf = self._new_keyframe(np.eye(4), frame, edge_maps, dts)
@@ -218,12 +239,12 @@ class DTVO:
             self.debug = FrameDebug(frame.rgb, edge_maps[0].mask, None, None, frame.levels[0].camera,
                                     1.0, False, True, dropped, kept)
             self.T_prev = np.eye(4)
+            self.t_prev = self.t_good = frame.timestamp
             self.frame_index += 1
             return self.T_prev
 
         # Sec. 4.2: constant / no / half / double motion hypotheses
-        prev, prev2 = self.T_prev, self.T_prev2 if self.T_prev2 is not None else self.T_prev
-        motion = inv(prev2) @ prev
+        prev, motion = self.T_prev, self.velocity
         T_kw = self.kf.T_wk
         hyps = {name: inv(prev @ scale_motion(motion, s)) @ T_kw
                 for name, s in (("constant", 1.0), ("none", 0.0), ("half", 0.5), ("double", 2.0))}
@@ -245,6 +266,11 @@ class DTVO:
         jump = inv(self.T_good @ scale_motion(self.motion_good, k)) @ T_wc
         lost = res.lost or (res.inlier_ratio < c.suspect_ratio and (
             np.linalg.norm(jump[:3, 3]) > k * c.suspect_jump_m or rot_angle_deg(jump[:3, :3]) > k * c.suspect_jump_deg))
+        moved = inv(self.T_good) @ T_wc   # speed limit, whatever the match ratio
+        dt_good = frame.timestamp - self.t_good
+        too_fast = (np.linalg.norm(moved[:3, 3]) > c.max_speed_mps * dt_good
+                    or rot_angle_deg(moved[:3, :3]) > c.max_turn_dps * dt_good)
+        lost = lost or too_fast
         self.lost_run = self.lost_run + 1 if lost else 0
         self.debug.lost = lost
         coasted = orthonormalize(prev @ motion)
@@ -252,8 +278,9 @@ class DTVO:
         # long as this frame has too few edges to anchor a keyframe (it would be as weak).
         if lost and (self.lost_run <= c.max_lost_frames or not can_anchor):
             record(self.kf.id, orthonormalize(inv(T_kw) @ coasted), res.inlier_ratio, res.hypothesis, True,
-                   False, refused=self.lost_run > c.max_lost_frames)
-            self.T_prev2, self.T_prev = self.T_prev, coasted
+                   False, refused=self.lost_run > c.max_lost_frames, too_fast=too_fast)
+            self.velocity = scale_motion(self.velocity, c.coast_damping)
+            self.T_prev, self.t_prev = coasted, frame.timestamp
             self.frame_index += 1
             return coasted
 
@@ -267,14 +294,16 @@ class DTVO:
             self.debug.is_keyframe = True
             T_wc = kf.T_wk  # refined by the window optimisation (unless the step was rejected)
             record(kf.id, np.eye(4), res.inlier_ratio, res.hypothesis, lost, True, weak=lost,
-                   ba_rejected=self.mapper.last_rejected)
+                   ba_rejected=self.mapper.last_rejected, too_fast=too_fast)
         else:
             # A keyframe was due but this frame cannot anchor one: keep tracking the old keyframe
             record(self.kf.id, orthonormalize(inv(res.T_cr)), res.inlier_ratio, res.hypothesis, res.lost, False,
                    refused=want_kf)
         self.motion_good = inv(self.T_prev) @ T_wc if self.lost_run == 0 else np.eye(4)
-        self.T_good = T_wc
-        self.T_prev2, self.T_prev = self.T_prev, T_wc
+        self.velocity = self._limit(inv(self.T_prev) @ T_wc, frame.timestamp - self.t_prev) \
+            if self.lost_run == 0 else scale_motion(self.velocity, c.coast_damping)
+        self.T_good, self.t_good = T_wc, frame.timestamp
+        self.T_prev, self.t_prev = T_wc, frame.timestamp
         self.frame_index += 1
         return T_wc
 

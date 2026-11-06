@@ -189,8 +189,9 @@ def compose_video(overlay_video: Path, out: Path, panel: TrajectoryPanel, fps: f
 
 def plot_evaluation(evs: dict, title: str, out: Path, show: bool):
     """evs: {label: Evaluation}, the first is the main estimate. Ground truth is drawn from it."""
+    import sys
     import matplotlib
-    if not show:
+    if not show and "matplotlib.pyplot" not in sys.modules:   # switching later would close open windows
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -228,6 +229,7 @@ def plot_evaluation(evs: dict, title: str, out: Path, show: bool):
     ax = fig.add_subplot(gs[2, 0])
     ax.axis("off")
     rows = [("ATE RMSE, best-fit alignment (TUM)", lambda e: f"{e.ate_rmse:.4f} m"),
+            ("Max position error, best fit / start-aligned", lambda e: f"{e.ate_max:.3g} / {e.start_max:.3g} m"),
             ("Rotation RMSE, best-fit alignment", lambda e: f"{e.rot_rmse_deg:.2f}°"),
             ("Position RMSE, start-aligned (plotted)", lambda e: f"{e.start_rmse:.4f} m"),
             ("RMSE x / y / z, start-aligned", lambda e: " / ".join(f"{v:.4f}" for v in e.axis_rmse) + " m"
@@ -244,7 +246,7 @@ def plot_evaluation(evs: dict, title: str, out: Path, show: bool):
             ax.text(x, 1.04, name, color=colour[name], transform=ax.transAxes, va="top", ha="right",
                     fontweight="bold")
     for i, (k, fn) in enumerate(rows):
-        y = 0.97 - i * 0.12 - (0.06 if multi else 0)
+        y = 0.97 - i * 0.108 - (0.06 if multi else 0)
         ax.text(0.0, y, k, color=MUTED, transform=ax.transAxes, va="top")
         for x, (name, e) in zip(xs, runs):
             v = f"{e.matched}" if multi and i == len(rows) - 1 else fn(e)   # no room for the path length

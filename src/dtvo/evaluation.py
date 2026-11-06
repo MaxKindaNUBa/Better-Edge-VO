@@ -88,6 +88,7 @@ class Evaluation:
     ate_max: float
     rot_rmse_deg: float           # geodesic orientation error, best-fit alignment
     start_rmse: float             # position RMSE, start-aligned
+    start_max: float              # largest position error, start-aligned
     start_rot_rmse_deg: float     # geodesic orientation RMSE, start-aligned
     axis_rmse: np.ndarray         # x, y, z (m), start-aligned
     rpy_rmse: np.ndarray          # roll, pitch, yaw (deg), start-aligned
@@ -163,7 +164,7 @@ def evaluate(est_stamps, est_poses, gt_stamps, gt_poses, max_dt: float = 0.02,
         t=t - t[0], est_xyz=pa, gt_xyz=pg, est_rpy=rpy_g + d, gt_rpy=rpy_g,
         ate_rmse=float(np.sqrt(np.mean(err ** 2))), ate_mean=float(err.mean()), ate_max=float(err.max()),
         rot_rmse_deg=float(np.sqrt(np.mean(rot_err_fit ** 2))),
-        start_rmse=float(np.sqrt(np.mean(sa_err ** 2))),
+        start_rmse=float(np.sqrt(np.mean(sa_err ** 2))), start_max=float(sa_err.max()),
         start_rot_rmse_deg=float(np.sqrt(np.mean(rot_err ** 2))),
         axis_rmse=np.sqrt(np.mean((pa - pg) ** 2, axis=0)),
         rpy_rmse=np.sqrt(np.mean(d ** 2, axis=0)),

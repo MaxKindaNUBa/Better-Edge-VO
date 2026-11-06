@@ -13,6 +13,9 @@ Keyframe guards (both runs, --no-guard switches them off for the ablation):
     keyframe check  a frame with too few / too clustered depth edges never becomes a
                     keyframe: the old one is kept (while lost: keep coasting)
     shift check     a window optimisation that moves any keyframe > 10 cm / 10 deg is undone
+    speed limit     a tracked pose further from the last trusted pose than the camera can move
+                    in the time since (1.5 m/s, 240 deg/s, a physical prior, never ground truth)
+                    counts as lost, whatever its match ratio; coasting slows down
 
 Usage (from the project root):
     conda run -n 312ml python -m src.run_masked_dtvo                 -> dataset selector window
@@ -22,7 +25,8 @@ Usage (from the project root):
              --mode coco             detector: coco / yoloe_text / yoloe_pf
              --min-prior P           mask objects with prior >= P (default 0.3 = "suspect")
              --no-baseline           don't run plain DTVO for comparison (half the VO time)
-             --no-guard              keyframe guards off (edge budget, keyframe check, shift check)
+             --no-guard              guards off (edge budget, keyframe check, shift check, speed limit)
+             --max-speed M --max-turn D   speed limit in m/s and deg/s (default 1.5, 240)
              --no-mapping            tracking only (both runs)
              --no-weights            plain alignment (both runs)
              --no-show               only save the figures, don't open a window
@@ -39,6 +43,7 @@ Every run gets its own folder results/<YYYY-MM-DD_HH-MM-SS>_run_masked_dtvo/ hol
 and per sequence, in <run folder>/<sequence>/:
     masked_dtvo_trajectory.txt   estimated poses, TUM format
     baseline_trajectory.txt      plain DTVO poses, TUM format
+    masked_dtvo_vs_gt.png the same for masked DTVO alone: ground truth vs masked DTVO only
     masked_dtvo_plot.png  x-y path, x / y / z and roll / pitch / yaw vs ground truth for both
                           runs, with RMSE (as dtvo_plot.png)
     masking_plot.png      position error over time for both runs, share of edges masked,
@@ -86,7 +91,7 @@ FRAME_COLS = ["frame", "timestamp", "edges", "edges_used", "masked_edges", "x_ma
               "detections", "masked_objects", "suspects", "scene_tags", "suspect_edges", "object_edges",
               "x_suspect", "x_any", "suspect_masks_depth", "suspect_masks_fallback",
               "depth_edges", "objects_unmasked", "keyframe_id", "is_keyframe", "lost", "kf_refused", "weak_kf",
-              "ba_rejected", "hypothesis", "matched_edges", "pos_err_m",
+              "ba_rejected", "too_fast", "hypothesis", "matched_edges", "pos_err_m",
               "baseline_keyframe_id", "baseline_lost", "baseline_kf_refused", "baseline_ba_rejected",
               "baseline_matched_edges", "baseline_pos_err_m",
               "ms_detect", "ms_mask", "ms_associate", "ms_vo", "ms_baseline"]
@@ -100,6 +105,8 @@ def guard_off(cfg: DTVOConfig):
     c.min_ref_points = c.min_top_points = c.min_cells = 0
     c.unmask_below_prior = 0.0
     cfg.mapping.max_kf_shift_m = cfg.mapping.max_kf_shift_deg = float("inf")
+    c.max_speed_mps = c.max_turn_dps = float("inf")
+    c.coast_damping = 1.0
 
 
 def vo_metrics(vo: DTVO, wall: float, cfg: DTVOConfig) -> dict:
@@ -109,6 +116,7 @@ def vo_metrics(vo: DTVO, wall: float, cfg: DTVOConfig) -> dict:
     return {"frames": n, "keyframes": len(vo.keyframes),
             "frames_lost": int(sum(bool(r.lost) for r in vo.records)), "fps": n / wall,
             "keyframes_refused": int(sum(r.kf_refused for r in vo.records)),
+            "frames_too_fast": int(sum(r.too_fast for r in vo.records)),
             "weak_keyframes": int(sum(r.weak_kf for r in vo.records)),
             "window_optimisations": st["ba_runs"], "window_optimisations_rejected": st["ba_rejected"],
             "rejected_max_shift_m": st["ba_rejected_shift_m"],
@@ -121,14 +129,16 @@ def vo_metrics(vo: DTVO, wall: float, cfg: DTVOConfig) -> dict:
             "mean_edges_used": float(np.mean([r.n_edges for r in vo.records])),
             "weighted_alignment": cfg.track.weighted, "window_optimisation": cfg.mapping.enabled,
             "keyframe_guards": {**{k: getattr(cfg.keyframe, k) for k in (
-                "min_ref_points", "min_top_points", "min_cells", "cell_share", "unmask_below_prior")},
+                "min_ref_points", "min_top_points", "min_cells", "cell_share", "unmask_below_prior",
+                "max_speed_mps", "max_turn_dps", "coast_damping")},
                 "max_kf_shift_m": cfg.mapping.max_kf_shift_m, "max_kf_shift_deg": cfg.mapping.max_kf_shift_deg}}
 
 
 def ev_metrics(ev) -> dict:
     return {"ate_rmse_m": ev.ate_rmse, "ate_mean_m": ev.ate_mean, "ate_max_m": ev.ate_max,
             "rot_rmse_deg": ev.rot_rmse_deg,
-            "start_aligned_rmse_m": ev.start_rmse, "start_aligned_rot_rmse_deg": ev.start_rot_rmse_deg,
+            "start_aligned_rmse_m": ev.start_rmse, "start_aligned_max_m": ev.start_max,
+            "start_aligned_rot_rmse_deg": ev.start_rot_rmse_deg,
             "start_aligned_rmse_xyz_m": ev.axis_rmse.tolist(),
             "start_aligned_rmse_roll_pitch_yaw_deg": ev.rpy_rmse.tolist(),
             "rpe_trans_m_per_s": ev.rpe_trans, "rpe_rot_deg_per_s": ev.rpe_rot,
@@ -138,8 +148,8 @@ def ev_metrics(ev) -> dict:
 
 def print_ev(name: str, ev):
     print(f"{name}:")
-    print(f"  best fit (TUM):  ATE RMSE {ev.ate_rmse:.4f} m, rotation RMSE {ev.rot_rmse_deg:.2f} deg")
-    print(f"  start-aligned:   position RMSE {ev.start_rmse:.4f} m (x {ev.axis_rmse[0]:.4f}, "
+    print(f"  best fit (TUM):  ATE RMSE {ev.ate_rmse:.4f} m, max {ev.ate_max:.4g} m, rotation RMSE {ev.rot_rmse_deg:.2f} deg")
+    print(f"  start-aligned:   position RMSE {ev.start_rmse:.4f} m, max {ev.start_max:.4g} m (x {ev.axis_rmse[0]:.4f}, "
           f"y {ev.axis_rmse[1]:.4f}, z {ev.axis_rmse[2]:.4f}), rotation RMSE {ev.start_rot_rmse_deg:.2f} deg "
           f"(roll {ev.rpy_rmse[0]:.2f}, pitch {ev.rpy_rmse[1]:.2f}, yaw {ev.rpy_rmse[2]:.2f})")
     print(f"  RPE per {ev.rpe_delta:g} s: {ev.rpe_trans:.4f} m, {ev.rpe_rot:.2f} deg")
@@ -160,6 +170,10 @@ def run_sequence(seq_dir: Path, out_dir: Path, detector: Detector, args, show: b
     cfg.track.weighted = not args.no_weights
     if args.no_guard:
         guard_off(cfg)
+    if args.max_speed is not None:
+        cfg.keyframe.max_speed_mps = args.max_speed
+    if args.max_turn is not None:
+        cfg.keyframe.max_turn_dps = args.max_turn
     end = len(seq) if args.frames <= 0 else min(len(seq), args.start + args.frames)
     print(f"{seq_dir.name}: {len(seq)} frames, running masked DTVO"
           f"{'' if args.no_baseline else ' and plain DTVO'} on {args.start}..{end - 1}")
@@ -222,7 +236,7 @@ def run_sequence(seq_dir: Path, out_dir: Path, detector: Detector, args, show: b
                      split.n_object_edges, f"{split.x_suspect:.4f}", f"{split.x_any:.4f}",
                      src_sus.get("depth", 0), sum(sus) - src_sus.get("depth", 0),
                      r.n_ref_points, r.n_unmasked, r.kf_id, int(r.is_keyframe), int(r.lost), int(r.kf_refused),
-                     int(r.weak_kf), int(r.ba_rejected), r.hypothesis, f"{r.inlier_ratio:.4f}", "",
+                     int(r.weak_kf), int(r.ba_rejected), int(r.too_fast), r.hypothesis, f"{r.inlier_ratio:.4f}", "",
                      *(["", "", "", ""] if rb is None else [rb.kf_id, int(rb.lost), int(rb.kf_refused),
                                                             int(rb.ba_rejected)]),
                      "" if rb is None else f"{rb.inlier_ratio:.4f}", "",
@@ -290,7 +304,7 @@ def run_sequence(seq_dir: Path, out_dir: Path, detector: Detector, args, show: b
     print(f"\nmasked DTVO: {n} frames in {t_vo:.1f} s ({n / t_vo:.1f} fps) | keyframes {m['keyframes']} | "
           f"frames flagged lost {m['frames_lost']}")
     print("  time per frame: " + ", ".join(f"{k} {v:.1f} ms" for k, v in m["ms_per_frame"].items()))
-    print(f"  guards: keyframes refused {m['keyframes_refused']}, weak keyframes {m['weak_keyframes']}, "
+    print(f"  guards: too fast {m['frames_too_fast']}, keyframes refused {m['keyframes_refused']}, weak keyframes {m['weak_keyframes']}, "
           f"window optimisations undone {m['window_optimisations_rejected']} of {m['window_optimisations']}, "
           f"objects given back {m['objects_unmasked']} (in {m['frames_with_unmasking']} frames)")
     d = metrics["detection"]
@@ -300,7 +314,7 @@ def run_sequence(seq_dir: Path, out_dir: Path, detector: Detector, args, show: b
     if base is not None:
         mb = metrics["baseline_dtvo"]
         print(f"plain DTVO: {n / t_base:.1f} fps | keyframes {mb['keyframes']} | frames flagged lost {mb['frames_lost']}")
-        print(f"  guards: keyframes refused {mb['keyframes_refused']}, weak keyframes {mb['weak_keyframes']}, "
+        print(f"  guards: too fast {mb['frames_too_fast']}, keyframes refused {mb['keyframes_refused']}, weak keyframes {mb['weak_keyframes']}, "
               f"window optimisations undone {mb['window_optimisations_rejected']} of {mb['window_optimisations']}")
 
     est_xyz, gt_xyz, base_xyz = np.array([T[:3, 3] for T in poses]), None, None
@@ -341,6 +355,9 @@ def run_sequence(seq_dir: Path, out_dir: Path, detector: Detector, args, show: b
                  + f"  -  ATE {ev.ate_rmse * 100:.1f} cm"
                  + (f" vs {ev_b.ate_rmse * 100:.1f} cm plain DTVO" if ev_b is not None else ""))
         plot_evaluation(evs, title, out_dir / "masked_dtvo_plot.png", show=show)
+        plot_evaluation({MASKED: ev}, f"Masked DTVO vs ground truth on {seq_dir.name}  -  ATE {ev.ate_rmse * 100:.1f} cm, "
+                        f"max error {ev.ate_max:.3g} m (best fit), {ev.start_max:.3g} m (start-aligned)",
+                        out_dir / "masked_dtvo_vs_gt.png", show=False)
 
     for row, k in zip(rows, range(n)):
         if err is not None and np.isfinite(err[k]):
@@ -414,6 +431,8 @@ def plot_masking(t, acc, vo, base, err, base_err, metrics, title, out):
     m, b, d = metrics["masked_dtvo"], metrics["baseline_dtvo"], metrics["detection"]
     cm = lambda x, k: f"{100 * x[k]:.1f} cm" if x and k in x else "-"
     rows = [("ATE RMSE (best fit)", cm(m, "ate_rmse_m"), cm(b, "ate_rmse_m")),
+            ("Max error, best fit", cm(m, "ate_max_m"), cm(b, "ate_max_m")),
+            ("Max error, start-aligned", cm(m, "start_aligned_max_m"), cm(b, "start_aligned_max_m")),
             ("Position RMSE, start-aligned", cm(m, "start_aligned_rmse_m"), cm(b, "start_aligned_rmse_m")),
             ("RPE per second", cm(m, "rpe_trans_m_per_s"), cm(b, "rpe_trans_m_per_s")),
             ("Rotation RMSE (best fit)", f"{m['rot_rmse_deg']:.2f}°" if "rot_rmse_deg" in m else "-",
@@ -425,6 +444,7 @@ def plot_masking(t, acc, vo, base, err, base_err, metrics, title, out):
              f"{b['keyframes']} / {b['frames_lost']}" if b else "-"),
             ("Keyframes refused / weak", f"{m['keyframes_refused']} / {m['weak_keyframes']}",
              f"{b['keyframes_refused']} / {b['weak_keyframes']}" if b else "-"),
+            ("Frames over the speed limit", f"{m['frames_too_fast']}", f"{b['frames_too_fast']}" if b else "-"),
             ("Window optimisations undone", f"{m['window_optimisations_rejected']} / {m['window_optimisations']}",
              f"{b['window_optimisations_rejected']} / {b['window_optimisations']}" if b else "-"),
             ("VO speed", f"{m['fps']:.1f} fps", f"{b['fps']:.1f} fps" if b else "-")]
@@ -465,10 +485,12 @@ def plot_masking(t, acc, vo, base, err, base_err, metrics, title, out):
 
 
 SUMMARY_COLS = ["sequence", "frames", "ate_masked_m", "ate_plain_m", "ate_change_pct",
+                "max_err_masked_m", "max_err_plain_m", "start_max_err_masked_m", "start_max_err_plain_m",
                 "start_rmse_masked_m", "start_rmse_plain_m", "rpe_masked_m_per_s", "rpe_plain_m_per_s",
                 "rot_rmse_masked_deg", "rot_rmse_plain_deg", "x_masked_mean", "x_masked_max",
                 "frames_with_masked_pct", "masked_per_frame", "fps_masked", "fps_plain",
-                "kf_refused_masked", "kf_refused_plain", "ba_undone_masked", "ba_undone_plain",
+                "too_fast_masked", "too_fast_plain", "kf_refused_masked", "kf_refused_plain",
+                "ba_undone_masked", "ba_undone_plain",
                 "objects_unmasked"]
 
 
@@ -477,12 +499,16 @@ def summary_row(m: dict) -> dict:
     return {"sequence": m["sequence"], "frames": m["frames"],
             "ate_masked_m": a.get("ate_rmse_m"), "ate_plain_m": b.get("ate_rmse_m"),
             "ate_change_pct": m.get("change_pct", {}).get("ate_rmse_m"),
+            "max_err_masked_m": a.get("ate_max_m"), "max_err_plain_m": b.get("ate_max_m"),
+            "start_max_err_masked_m": a.get("start_aligned_max_m"),
+            "start_max_err_plain_m": b.get("start_aligned_max_m"),
             "start_rmse_masked_m": a.get("start_aligned_rmse_m"), "start_rmse_plain_m": b.get("start_aligned_rmse_m"),
             "rpe_masked_m_per_s": a.get("rpe_trans_m_per_s"), "rpe_plain_m_per_s": b.get("rpe_trans_m_per_s"),
             "rot_rmse_masked_deg": a.get("rot_rmse_deg"), "rot_rmse_plain_deg": b.get("rot_rmse_deg"),
             "x_masked_mean": d["x_masked"].get("mean"), "x_masked_max": d["x_masked"].get("max"),
             "frames_with_masked_pct": d["frames_with_masked_pct"], "masked_per_frame": d["masked_per_frame"],
             "fps_masked": a["fps"], "fps_plain": b.get("fps"),
+            "too_fast_masked": a.get("frames_too_fast"), "too_fast_plain": b.get("frames_too_fast"),
             "kf_refused_masked": a.get("keyframes_refused"), "kf_refused_plain": b.get("keyframes_refused"),
             "ba_undone_masked": a.get("window_optimisations_rejected"),
             "ba_undone_plain": b.get("window_optimisations_rejected"), "objects_unmasked": a.get("objects_unmasked")}
@@ -501,16 +527,18 @@ def write_summary(run_dir: Path):
         plt = _plt()
         names = [r["sequence"].replace("rgbd_dataset_", "").replace("rgbd_", "") for r in rows]
         yy = np.arange(len(rows))
-        fig, axes = plt.subplots(1, 2, figsize=(14, 0.42 * len(rows) + 2.2), sharey=True,
+        fig, axes = plt.subplots(1, 3, figsize=(18, 0.42 * len(rows) + 2.2), sharey=True,
                                  constrained_layout=True)
-        ax = axes[0]
-        for k, (key, name) in enumerate((("ate_masked_m", MASKED), ("ate_plain_m", BASELINE))):
-            vals = [100 * r[key] if r[key] is not None else np.nan for r in rows]
-            ax.barh(yy + (k - 0.5) * 0.4, vals, height=0.36, color=RUN_COLOURS[k], label=name,
-                    edgecolor="white", linewidth=1)
-        ax.set_title("ATE RMSE, best fit (cm)", loc="left", fontweight="bold")
-        ax.legend(frameon=False, loc="lower right")
-        ax = axes[1]
+        for ax, keys, head in ((axes[0], ("ate_masked_m", "ate_plain_m"), "ATE RMSE, best fit (m, log)"),
+                               (axes[1], ("max_err_masked_m", "max_err_plain_m"), "Max error, best fit (m, log)")):
+            for k, (key, name) in enumerate(zip(keys, (MASKED, BASELINE))):
+                vals = [r[key] if r[key] is not None else np.nan for r in rows]
+                ax.barh(yy + (k - 0.5) * 0.4, vals, height=0.36, color=RUN_COLOURS[k], label=name,
+                        edgecolor="white", linewidth=1)
+            ax.set_xscale("log")   # errors range from cm to km
+            ax.set_title(head, loc="left", fontweight="bold")
+        axes[0].legend(frameon=False, loc="lower right")
+        ax = axes[2]
         ax.barh(yy, [100 * r["x_masked_mean"] for r in rows], height=0.5, color=RUN_COLOURS[0],
                 edgecolor="white", linewidth=1)
         ax.set_title("Mean share of edges masked (%)", loc="left", fontweight="bold")
@@ -538,6 +566,8 @@ def main():
                     help="mask objects whose class prior is at least this")
     ap.add_argument("--no-baseline", action="store_true", help="don't run plain DTVO alongside")
     ap.add_argument("--no-guard", action="store_true", help="keyframe guards off (ablation)")
+    ap.add_argument("--max-speed", type=float, default=None, help="speed limit, m/s (default 1.5)")
+    ap.add_argument("--max-turn", type=float, default=None, help="turn-rate limit, deg/s (default 240)")
     ap.add_argument("--no-mapping", action="store_true", help="disable sliding-window optimisation")
     ap.add_argument("--no-weights", action="store_true", help="disable weighted edge alignment")
     ap.add_argument("--no-show", action="store_true", help="don't open the plot window")
